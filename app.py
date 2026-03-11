@@ -561,15 +561,35 @@ def search_brand(brand: str) -> list:
 
     return raw
 
+def parse_token_ids(raw_token_ids) -> list[str]:
+    if isinstance(raw_token_ids, list):
+        return [str(token).strip() for token in raw_token_ids if str(token).strip()]
+    if isinstance(raw_token_ids, str):
+        try:
+            parsed = json.loads(raw_token_ids)
+            if isinstance(parsed, list):
+                return [str(token).strip() for token in parsed if str(token).strip()]
+        except Exception:
+            cleaned = raw_token_ids.strip().strip("[]")
+            if cleaned:
+                return [token.strip().strip('"') for token in cleaned.split(",") if token.strip()]
+    return []
+
+
 @st.cache_data(ttl=60, show_spinner=False)
-def get_price_history(token_id: str, interval: str = "1d") -> list:
-    try:
-        r = get_session().get(f"{CLOB}/prices-history", params={
-            "tokenID": token_id, "interval": interval, "fidelity": 60
-        }, timeout=REQUEST_TIMEOUT)
-        return r.json().get("history", [])
-    except Exception:
-        return []
+def get_price_history(token_ids: tuple[str, ...], interval: str = "1d") -> list:
+    for token_id in token_ids:
+        try:
+            r = get_session().get(f"{CLOB}/prices-history", params={
+                "tokenID": token_id, "interval": interval, "fidelity": 60
+            }, timeout=REQUEST_TIMEOUT)
+            payload = r.json()
+            history = payload.get("history", []) if isinstance(payload, dict) else []
+            if history:
+                return history
+        except Exception:
+            continue
+    return []
 
 def parse_yes_prob(m):
     try:
@@ -845,10 +865,10 @@ if brand and raw:
                             horizontal=True, label_visibility="collapsed", key="history_interval")
 
         try:
-            token_ids = json.loads(selected["token_id"])
+            token_ids = parse_token_ids(selected["token_id"])
             if token_ids:
                 with st.spinner("Loading price history…"):
-                    history = get_price_history(token_ids[0], interval)
+                    history = get_price_history(tuple(token_ids), interval)
                 if history:
                     fig3 = plot_price_history(history, selected_q)
                     if fig3:
