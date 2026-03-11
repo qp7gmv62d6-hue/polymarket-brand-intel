@@ -1,0 +1,11 @@
+term,aliases,industry,product_type,parent_brand
+OpenAI,chatgpt|gpt 4|gpt-4|gpt 5|gpt-5|sora|operator,Artificial Intelligence,AI Platform,OpenAI
+Sora,sora 2|sora2|openai sora,Artificial Intelligence,Video Generation,OpenAI
+ChatGPT,gpt|chat gpt|gpt 4|gpt-4|gpt 5|gpt-5,Artificial Intelligence,Text Generation,OpenAI
+Anthropic,claude,Artificial Intelligence,AI Platform,Anthropic
+Claude,claude 3|claude sonnet,Artificial Intelligence,Text Generation,Anthropic
+Google,alphabet|gemini,Artificial Intelligence,AI Platform,Google
+Gemini,bard|google gemini,Artificial Intelligence,Text Generation,Google
+Meta,facebook|instagram|threads,Social Networking,Consumer Platform,Meta
+Instagram,ig,Social Networking,Social App,Meta
+X,twitter|x corp,Social Networking,Social App,X

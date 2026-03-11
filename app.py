@@ -216,6 +216,7 @@ MAX_TAGS = 5
 MAX_MARKET_PAGES = 3
 MAX_EVENT_PAGES = 2
 TAXONOMY_FILE = "Content Taxonomy 3.1 (1).tsv"
+BRAND_METADATA_FILE = "brand_metadata.csv"
 TAXONOMY_ALIAS_RULES = {
     "Artificial Intelligence": [
         "ai", "artificial intelligence", "llm", "gpt", "chatgpt", "openai",
@@ -305,6 +306,28 @@ def build_aliases(name: str, path_parts: list[str]) -> set[str]:
     return {alias for alias in aliases if alias}
 
 
+def parse_csv_list(value: str) -> list[str]:
+    return [item.strip() for item in (value or "").split("|") if item and item.strip()]
+
+
+def parse_facet_values(value: str) -> list[str]:
+    return [item.strip() for item in (value or "").split(",") if item and item.strip()]
+
+
+def extract_facet_options(series: pd.Series) -> list[str]:
+    options = set()
+    for value in series.fillna(""):
+        options.update(parse_facet_values(value))
+    return sorted(options)
+
+
+def row_has_any_facet_value(value: str, selected: list[str]) -> bool:
+    if not selected:
+        return True
+    row_values = set(parse_facet_values(value))
+    return any(item in row_values for item in selected)
+
+
 @st.cache_data(show_spinner=False)
 def load_taxonomy() -> list[dict]:
     path = Path(TAXONOMY_FILE)
@@ -331,6 +354,56 @@ def load_taxonomy() -> list[dict]:
             "depth": len(path_parts),
         })
     return taxonomy
+
+
+@st.cache_data(show_spinner=False)
+def load_brand_metadata() -> list[dict]:
+    path = Path(BRAND_METADATA_FILE)
+    if not path.exists():
+        return []
+
+    entries = []
+    with path.open(newline="") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            term = (row.get("term") or "").strip()
+            if not term:
+                continue
+            aliases = {normalize_text(term)}
+            aliases.update(normalize_text(alias) for alias in parse_csv_list(row.get("aliases", "")))
+            entries.append({
+                "term": term,
+                "industry": (row.get("industry") or "").strip(),
+                "product_type": (row.get("product_type") or "").strip(),
+                "parent_brand": (row.get("parent_brand") or "").strip(),
+                "aliases": sorted(alias for alias in aliases if alias),
+            })
+    return entries
+
+
+def collect_market_facets(text: str) -> dict[str, list[str]]:
+    facets = {
+        "industry": set(),
+        "product_type": set(),
+        "parent_brand": set(),
+        "entity": set(),
+    }
+    normalized = normalize_text(text)
+    if not normalized:
+        return {key: [] for key in facets}
+
+    for entry in load_brand_metadata():
+        if not any(alias in normalized for alias in entry["aliases"]):
+            continue
+        facets["entity"].add(entry["term"])
+        if entry["industry"]:
+            facets["industry"].add(entry["industry"])
+        if entry["product_type"]:
+            facets["product_type"].add(entry["product_type"])
+        if entry["parent_brand"]:
+            facets["parent_brand"].add(entry["parent_brand"])
+
+    return {key: sorted(values) for key, values in facets.items()}
 
 
 def build_search_terms(brand: str) -> list[str]:
@@ -601,7 +674,9 @@ def build_df(markets: list) -> pd.DataFrame:
     rows = []
     for m in markets:
         question = m.get("question", "")
-        topic_group, topic_detail = classify_market_taxonomy(market_search_text(m))
+        searchable_text = market_search_text(m)
+        topic_group, topic_detail = classify_market_taxonomy(searchable_text)
+        facets = collect_market_facets(searchable_text)
         rows.append({
             "question":    question,
             "status":      "Closed" if m.get("closed") else "Open",
@@ -614,6 +689,11 @@ def build_df(markets: list) -> pd.DataFrame:
             "token_id":    (m.get("clobTokenIds") or "[]"),
             "topic":       topic_group,
             "topic_detail": topic_detail,
+            "industry":    ", ".join(facets["industry"]),
+            "product_type": ", ".join(facets["product_type"]),
+            "parent_brand": ", ".join(facets["parent_brand"]),
+            "matched_entity": ", ".join(facets["entity"]),
+            "search_text": searchable_text,
             "_raw":        m,
         })
     df = pd.DataFrame(rows)
@@ -788,15 +868,67 @@ if brand and raw:
             <div class="metric-sub">{risk_label} risk level</div>
         </div>""", unsafe_allow_html=True)
 
+    st.markdown('<div class="section-header">Refine Results</div>', unsafe_allow_html=True)
+
+    industry_options = extract_facet_options(df["industry"])
+    product_options = extract_facet_options(df["product_type"])
+    parent_options = extract_facet_options(df["parent_brand"])
+    topic_options = sorted(value for value in df["topic_detail"].dropna().unique() if value and value != "Other")
+
+    rf1, rf2 = st.columns([3, 2])
+    with rf1:
+        refine_text = st.text_input(
+            "Refine within results",
+            placeholder="Filter these results by term, tag, product, or brand alias",
+            key="refine_text",
+        )
+    with rf2:
+        status_filter = st.selectbox("Status", ["All", "Open", "Closed"],
+                                     label_visibility="collapsed", key="status_filter")
+
+    rf3, rf4, rf5, rf6 = st.columns(4)
+    with rf3:
+        selected_topics = st.multiselect("Topic", topic_options, key="topic_filter")
+    with rf4:
+        selected_industries = st.multiselect("Industry", industry_options, key="industry_filter")
+    with rf5:
+        selected_product_types = st.multiselect("Product Type", product_options, key="product_type_filter")
+    with rf6:
+        selected_parent_brands = st.multiselect("Parent Brand", parent_options, key="parent_brand_filter")
+
+    filtered = df.copy()
+    if status_filter != "All":
+        filtered = filtered[filtered["status"] == status_filter]
+    if selected_topics:
+        filtered = filtered[filtered["topic_detail"].isin(selected_topics)]
+    if selected_industries:
+        filtered = filtered[filtered["industry"].apply(lambda value: row_has_any_facet_value(value, selected_industries))]
+    if selected_product_types:
+        filtered = filtered[filtered["product_type"].apply(lambda value: row_has_any_facet_value(value, selected_product_types))]
+    if selected_parent_brands:
+        filtered = filtered[filtered["parent_brand"].apply(lambda value: row_has_any_facet_value(value, selected_parent_brands))]
+    if refine_text.strip():
+        needle = normalize_text(refine_text)
+        filtered = filtered[
+            filtered["search_text"].fillna("").str.contains(needle, regex=False)
+            | filtered["industry"].fillna("").str.lower().str.contains(needle, regex=False)
+            | filtered["product_type"].fillna("").str.lower().str.contains(needle, regex=False)
+            | filtered["parent_brand"].fillna("").str.lower().str.contains(needle, regex=False)
+            | filtered["matched_entity"].fillna("").str.lower().str.contains(needle, regex=False)
+        ]
+
+    filtered_open_df = filtered[filtered["status"] == "Open"]
+    st.caption(f"Showing {len(filtered)} of {len(df)} markets after refinement.")
+
     # ── Charts row ────────────────────────────────────────────────
     st.markdown('<div class="section-header">Market Intelligence</div>', unsafe_allow_html=True)
 
     c1, c2 = st.columns(2)
     with c1:
-        fig1 = plot_volume_by_type(df)
+        fig1 = plot_volume_by_type(filtered)
         st.plotly_chart(fig1, use_container_width=True, config={"displayModeBar": False})
     with c2:
-        fig2 = plot_open_probs(df)
+        fig2 = plot_open_probs(filtered)
         if fig2:
             st.plotly_chart(fig2, use_container_width=True, config={"displayModeBar": False})
         else:
@@ -805,18 +937,11 @@ if brand and raw:
     # ── Markets table ─────────────────────────────────────────────
     st.markdown('<div class="section-header">All Markets</div>', unsafe_allow_html=True)
 
-    # Filter controls
-    fc1, fc2, fc3 = st.columns([2, 2, 4])
+    fc1, fc2 = st.columns([2, 4])
     with fc1:
-        status_filter = st.selectbox("Status", ["All", "Open", "Closed"],
-                                     label_visibility="collapsed", key="status_filter")
-    with fc2:
         sort_by = st.selectbox("Sort by", ["Volume", "YES Probability", "24hr Volume"],
                                label_visibility="collapsed", key="sort_by")
 
-    filtered = df.copy()
-    if status_filter != "All":
-        filtered = filtered[filtered["status"] == status_filter]
     if sort_by == "YES Probability":
         filtered = filtered.sort_values("yes_prob", ascending=False)
     elif sort_by == "24hr Volume":
@@ -854,7 +979,7 @@ if brand and raw:
     st.markdown('<div class="section-header">Probability History</div>', unsafe_allow_html=True)
     st.caption("Select an open market to see how the crowd probability has shifted over time.")
 
-    open_markets = open_df[open_df["yes_prob"].notna()]
+    open_markets = filtered_open_df[filtered_open_df["yes_prob"].notna()]
     if not open_markets.empty:
         market_options = {row["question"][:80]: row for _, row in open_markets.iterrows()}
         selected_q = st.selectbox("Pick a market", list(market_options.keys()),
@@ -882,15 +1007,17 @@ if brand and raw:
     # ── Export ────────────────────────────────────────────────────
     st.markdown('<div class="section-header">Export</div>', unsafe_allow_html=True)
 
-    export_df = df[["question","status","yes_prob","volume","volume_24hr",
-                    "liquidity","end_date","topic","topic_detail","tags"]].copy()
+    export_df = filtered[["question","status","yes_prob","volume","volume_24hr",
+                          "liquidity","end_date","topic","topic_detail","industry",
+                          "product_type","parent_brand","matched_entity","tags"]].copy()
     export_df.columns = ["Question","Status","YES%","Volume","24hr Vol",
-                          "Liquidity","End Date","Topic","Topic Detail","Tags"]
+                          "Liquidity","End Date","Topic","Topic Detail","Industry",
+                          "Product Type","Parent Brand","Matched Entity","Tags"]
 
     csv = export_df.to_csv(index=False)
     filename = brand.lower().replace(" ", "_") + "_polymarket.csv"
     st.download_button(
-        label=f"⬇ Download CSV ({len(df)} markets)",
+        label=f"⬇ Download CSV ({len(filtered)} markets)",
         data=csv, file_name=filename, mime="text/csv",
     )
 
