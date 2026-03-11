@@ -1,6 +1,7 @@
 import streamlit as st
 import requests
 import json
+import re
 import pandas as pd
 import plotly.graph_objects as go
 
@@ -212,6 +213,19 @@ REQUEST_TIMEOUT = 8
 MAX_TAGS = 5
 MAX_MARKET_PAGES = 3
 MAX_EVENT_PAGES = 2
+BRAND_ALIASES = {
+    "chatgpt": ["chatgpt", "openai", "gpt-4", "gpt 4", "gpt-5", "gpt 5", "sam altman", "sora"],
+    "openai": ["openai", "chatgpt", "gpt-4", "gpt 4", "gpt-5", "gpt 5", "sam altman", "sora"],
+    "google": ["google", "gemini", "alphabet"],
+    "x": ["x", "twitter", "elon"],
+    "twitter": ["twitter", "x", "elon"],
+    "facebook": ["facebook", "meta", "instagram", "zuckerberg"],
+    "meta": ["meta", "facebook", "instagram", "zuckerberg"],
+}
+
+
+def normalize_text(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", (value or "").lower()).strip()
 
 
 def build_search_terms(brand: str) -> list[str]:
@@ -242,6 +256,67 @@ def get_session() -> requests.Session:
     session = requests.Session()
     session.headers.update({"User-Agent": "polymarket-brand-intel/1.0"})
     return session
+
+
+def build_match_terms(brand: str) -> list[str]:
+    normalized_brand = normalize_text(brand)
+    if not normalized_brand:
+        return []
+
+    terms = [normalized_brand]
+    words = [word for word in normalized_brand.split() if len(word) >= 4]
+    terms.extend(words)
+    terms.extend(BRAND_ALIASES.get(normalized_brand, []))
+
+    seen = set()
+    deduped = []
+    for term in terms:
+        normalized_term = normalize_text(term)
+        if normalized_term and normalized_term not in seen:
+            deduped.append(normalized_term)
+            seen.add(normalized_term)
+    return deduped
+
+
+def market_search_text(market: dict) -> str:
+    chunks = [
+        market.get("question", ""),
+        market.get("description", ""),
+        market.get("slug", ""),
+    ]
+    tags = market.get("tags") or []
+    chunks.extend(tag.get("label", "") for tag in tags if isinstance(tag, dict))
+    events = market.get("events") or []
+    for event in events:
+        if isinstance(event, dict):
+            chunks.extend([
+                event.get("title", ""),
+                event.get("slug", ""),
+                event.get("subtitle", ""),
+            ])
+    return normalize_text(" ".join(chunks))
+
+
+def is_relevant_market(market: dict, brand: str) -> bool:
+    text = market_search_text(market)
+    if not text:
+        return False
+
+    brand_text = normalize_text(brand)
+    match_terms = build_match_terms(brand)
+
+    if brand_text and brand_text in text:
+        return True
+
+    brand_words = [word for word in brand_text.split() if len(word) >= 4]
+    if len(brand_words) > 1 and all(word in text for word in brand_words):
+        return True
+
+    strong_aliases = [term for term in match_terms if " " in term or len(term) >= 5]
+    if any(term in text for term in strong_aliases):
+        return True
+
+    return False
 
 @st.cache_data(ttl=300, show_spinner=False)
 def search_brand(brand: str) -> list:
@@ -274,11 +349,13 @@ def search_brand(brand: str) -> list:
                 offset = page * 100
                 mr = session.get(f"{GAMMA}/markets", params={
                     "tag_id": tid, "limit": 100, "offset": offset,
-                    "order": "volume", "ascending": "false"
+                    "order": "volume", "ascending": "false",
+                    "active": "true", "closed": "false"
                 }, timeout=REQUEST_TIMEOUT)
                 items = mr.json()
                 for m in items:
-                    add(m)
+                    if is_relevant_market(m, brand):
+                        add(m)
                 if len(items) < 100:
                     break
     except Exception:
@@ -292,7 +369,13 @@ def search_brand(brand: str) -> list:
                 offset = page * 100
                 er = session.get(
                     f"{GAMMA}/events",
-                    params={"q": term, "limit": 100, "offset": offset},
+                    params={
+                        "q": term,
+                        "limit": 100,
+                        "offset": offset,
+                        "active": "true",
+                        "closed": "false",
+                    },
                     timeout=REQUEST_TIMEOUT,
                 )
                 events = er.json()
@@ -306,7 +389,8 @@ def search_brand(brand: str) -> list:
                         except Exception:
                             markets = []
                     for m in markets:
-                        add(m)
+                        if is_relevant_market(m, brand):
+                            add(m)
                 if len(events) < 100:
                     break
         except Exception:
@@ -331,8 +415,6 @@ def parse_yes_prob(m):
     except: return None
 
 def build_df(markets: list) -> pd.DataFrame:
-    KEEP = ["openai","chatgpt","gpt-","gpt4","gpt5","gpt 4","gpt 5",
-            "sam altman","sora","dall-e","dalle","o1 model","o3"]
     rows = []
     for m in markets:
         rows.append({
