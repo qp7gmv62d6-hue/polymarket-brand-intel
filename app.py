@@ -1,9 +1,7 @@
 import streamlit as st
 import requests
 import json
-import time
 import pandas as pd
-import plotly.express as px
 import plotly.graph_objects as go
 
 # ── Page config ───────────────────────────────────────────────────
@@ -210,11 +208,47 @@ hr { border-color: var(--border) !important; }
 # ── API helpers ───────────────────────────────────────────────────
 GAMMA = "https://gamma-api.polymarket.com"
 CLOB  = "https://clob.polymarket.com"
+REQUEST_TIMEOUT = 8
+MAX_TAGS = 5
+MAX_MARKET_PAGES = 3
+MAX_EVENT_PAGES = 2
+
+
+def build_search_terms(brand: str) -> list[str]:
+    brand = " ".join(brand.split()).strip()
+    if not brand:
+        return []
+
+    terms = [brand]
+    parts = [part for part in brand.split() if len(part) >= 4]
+
+    if len(parts) > 1:
+        terms.extend(parts[:2])
+        acronym = "".join(part[0] for part in parts if part[0].isalnum())
+        if len(acronym) >= 3:
+            terms.append(acronym.upper())
+
+    seen = set()
+    deduped = []
+    for term in terms:
+        key = term.lower()
+        if key not in seen:
+            deduped.append(term)
+            seen.add(key)
+    return deduped
+
+
+def get_session() -> requests.Session:
+    session = requests.Session()
+    session.headers.update({"User-Agent": "polymarket-brand-intel/1.0"})
+    return session
 
 @st.cache_data(ttl=300, show_spinner=False)
 def search_brand(brand: str) -> list:
     """Fetch all markets for a brand using tags + events sweep."""
     raw, seen = [], set()
+    session = get_session()
+    search_terms = build_search_terms(brand)
 
     def add(m):
         mid = m.get("id") or m.get("conditionId", "")
@@ -222,46 +256,59 @@ def search_brand(brand: str) -> list:
             raw.append(m); seen.add(mid); return True
         return False
 
+    if not search_terms:
+        return raw
+
     # Tag lookup
     try:
-        r = requests.get(f"{GAMMA}/tags", params={"q": brand, "limit": 20}, timeout=10)
-        for tag in r.json():
+        r = session.get(
+            f"{GAMMA}/tags",
+            params={"q": search_terms[0], "limit": MAX_TAGS},
+            timeout=REQUEST_TIMEOUT,
+        )
+        for tag in r.json()[:MAX_TAGS]:
             tid = tag.get("id")
-            if not tid: continue
-            offset = 0
-            while True:
-                mr = requests.get(f"{GAMMA}/markets", params={
+            if not tid:
+                continue
+            for page in range(MAX_MARKET_PAGES):
+                offset = page * 100
+                mr = session.get(f"{GAMMA}/markets", params={
                     "tag_id": tid, "limit": 100, "offset": offset,
                     "order": "volume", "ascending": "false"
-                }, timeout=10)
+                }, timeout=REQUEST_TIMEOUT)
                 items = mr.json()
-                for m in items: add(m)
-                if len(items) < 100: break
-                offset += 100
-                time.sleep(0.05)
+                for m in items:
+                    add(m)
+                if len(items) < 100:
+                    break
     except Exception:
         pass
 
     # Events sweep
-    for term in [brand] + brand.split():
+    for term in search_terms:
         if len(term) < 3: continue
         try:
-            offset = 0
-            while True:
-                er = requests.get(f"{GAMMA}/events",
-                    params={"q": term, "limit": 100, "offset": offset}, timeout=10)
+            for page in range(MAX_EVENT_PAGES):
+                offset = page * 100
+                er = session.get(
+                    f"{GAMMA}/events",
+                    params={"q": term, "limit": 100, "offset": offset},
+                    timeout=REQUEST_TIMEOUT,
+                )
                 events = er.json()
-                if not events: break
+                if not events:
+                    break
                 for ev in events:
                     markets = ev.get("markets") or []
                     if isinstance(markets, str):
-                        try: markets = json.loads(markets)
-                        except: markets = []
+                        try:
+                            markets = json.loads(markets)
+                        except Exception:
+                            markets = []
                     for m in markets:
                         add(m)
-                if len(events) < 100: break
-                offset += 100
-                time.sleep(0.05)
+                if len(events) < 100:
+                    break
         except Exception:
             pass
 
@@ -270,9 +317,9 @@ def search_brand(brand: str) -> list:
 @st.cache_data(ttl=60, show_spinner=False)
 def get_price_history(token_id: str, interval: str = "1d") -> list:
     try:
-        r = requests.get(f"{CLOB}/prices-history", params={
+        r = get_session().get(f"{CLOB}/prices-history", params={
             "tokenID": token_id, "interval": interval, "fidelity": 60
-        }, timeout=10)
+        }, timeout=REQUEST_TIMEOUT)
         return r.json().get("history", [])
     except Exception:
         return []
