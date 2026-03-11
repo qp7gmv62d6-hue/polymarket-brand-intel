@@ -2,8 +2,10 @@ import streamlit as st
 import requests
 import json
 import re
+import csv
 import pandas as pd
 import plotly.graph_objects as go
+from pathlib import Path
 
 # ── Page config ───────────────────────────────────────────────────
 st.set_page_config(
@@ -213,6 +215,56 @@ REQUEST_TIMEOUT = 8
 MAX_TAGS = 5
 MAX_MARKET_PAGES = 3
 MAX_EVENT_PAGES = 2
+TAXONOMY_FILE = "Content Taxonomy 3.1 (1).tsv"
+TAXONOMY_ALIAS_RULES = {
+    "Artificial Intelligence": [
+        "ai", "artificial intelligence", "llm", "gpt", "chatgpt", "openai",
+        "anthropic", "claude", "gemini", "sora", "model", "inference",
+    ],
+    "Computer Software and Applications": [
+        "software", "app", "application", "saas", "platform", "tool",
+        "assistant", "api",
+    ],
+    "Cloud Computing": ["cloud", "azure", "aws", "gcp", "compute"],
+    "Social Networking": ["social network", "social media", "x", "twitter"],
+    "Programming Languages": ["python", "javascript", "typescript", "coding"],
+    "Consumer Electronics": ["device", "hardware", "wearable", "smartphone"],
+    "Business I.T.": ["enterprise software", "it spending", "it budget"],
+    "Executive Leadership & Management": [
+        "ceo", "founder", "board", "chairman", "executive", "leadership",
+        "sam altman", "resign", "fired", "step down",
+    ],
+    "Venture Capital": ["venture capital", "funding", "raise", "series a", "series b"],
+    "Private Equity": ["private equity", "buyout"],
+    "Mergers and Acquisitions": ["m&a", "merger", "acquisition", "acquire"],
+    "Stocks and Bonds": ["stock", "shares", "equity", "market cap", "valuation", "ipo"],
+    "Financial Regulation": ["regulation", "regulatory", "sec", "ftc", "doj", "eu"],
+    "Legal Services Industry": ["lawsuit", "legal", "court", "sue", "antitrust"],
+    "Political Issues & Policy": ["policy", "bill", "law", "ban", "tariff"],
+    "Elections": ["election", "vote", "ballot", "primary"],
+    "Cryptocurrency": ["crypto", "bitcoin", "ethereum", "solana", "dogecoin", "xrp"],
+    "Movies": ["movie", "film", "box office"],
+    "Television": ["tv", "television", "series", "season finale"],
+    "Music": ["album", "song", "tour", "single"],
+    "eSports": ["esports", "esport"],
+    "Sports": ["game", "match", "season", "tournament", "championship"],
+}
+RISK_DETAILS = {
+    "Executive Leadership & Management",
+    "Financial Regulation",
+    "Legal Services Industry",
+    "Political Issues & Policy",
+    "Elections",
+    "Mergers and Acquisitions",
+    "Stocks and Bonds",
+    "Venture Capital",
+    "Private Equity",
+}
+DOWNSIDE_TERMS = [
+    "not ", "won't", "willnt", "lose", "less than", "under", "below", "delay",
+    "miss", "ban", "fine", "sue", "lawsuit", "investigation", "fired",
+    "resign", "step down", "fail", "drop", "fall", "down", "denied",
+]
 BRAND_ALIASES = {
     "chatgpt": ["chatgpt", "openai", "gpt-4", "gpt 4", "gpt-5", "gpt 5", "sam altman", "sora"],
     "openai": ["openai", "chatgpt", "gpt-4", "gpt 4", "gpt-5", "gpt 5", "sam altman", "sora"],
@@ -226,6 +278,59 @@ BRAND_ALIASES = {
 
 def normalize_text(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", (value or "").lower()).strip()
+
+
+def has_term(text: str, term: str) -> bool:
+    normalized_term = normalize_text(term)
+    if not normalized_term:
+        return False
+    return normalized_term in text
+
+
+def normalize_path(parts: list[str]) -> list[str]:
+    return [part.strip() for part in parts if part and part.strip()]
+
+
+def build_aliases(name: str, path_parts: list[str]) -> set[str]:
+    aliases = {normalize_text(name)}
+    for part in path_parts:
+        aliases.add(normalize_text(part))
+        if "&" in part:
+            aliases.update(normalize_text(piece) for piece in part.split("&"))
+
+    for part in path_parts + [name]:
+        for alias in TAXONOMY_ALIAS_RULES.get(part, []):
+            aliases.add(normalize_text(alias))
+
+    return {alias for alias in aliases if alias}
+
+
+@st.cache_data(show_spinner=False)
+def load_taxonomy() -> list[dict]:
+    path = Path(TAXONOMY_FILE)
+    if not path.exists():
+        return []
+
+    with path.open() as handle:
+        rows = list(csv.reader(handle, delimiter="\t"))
+
+    taxonomy = []
+    for row in rows[2:]:
+        if len(row) < 7:
+            continue
+        name = row[2].strip()
+        if not name:
+            continue
+        path_parts = normalize_path(row[3:7])
+        if not path_parts:
+            continue
+        taxonomy.append({
+            "name": name,
+            "path": path_parts,
+            "aliases": sorted(build_aliases(name, path_parts)),
+            "depth": len(path_parts),
+        })
+    return taxonomy
 
 
 def build_search_terms(brand: str) -> list[str]:
@@ -295,6 +400,64 @@ def market_search_text(market: dict) -> str:
                 event.get("subtitle", ""),
             ])
     return normalize_text(" ".join(chunks))
+
+
+def classify_market_taxonomy(question: str) -> tuple[str, str]:
+    text = normalize_text(question)
+    best_entry = None
+    best_score = 0
+
+    for entry in load_taxonomy():
+        score = 0
+        for alias in entry["aliases"]:
+            if has_term(text, alias):
+                score += 2 + min(len(alias.split()), 3)
+
+        exact_name = normalize_text(entry["name"])
+        if exact_name and has_term(text, exact_name):
+            score += 4
+
+        if score == 0:
+            continue
+
+        score += entry["depth"]
+        if best_entry is None or score > best_score or (
+            score == best_score and entry["depth"] > best_entry["depth"]
+        ):
+            best_entry = entry
+            best_score = score
+
+    if best_entry is None:
+        return "Other", "Other"
+
+    path = best_entry["path"]
+    topic_group = path[1] if len(path) > 1 else path[0]
+    topic_detail = path[-1]
+    return topic_group, topic_detail
+
+
+def is_downside_market(question: str, topic_detail: str) -> bool:
+    text = normalize_text(question)
+    if topic_detail not in RISK_DETAILS:
+        return False
+
+    if any(has_term(text, term) for term in DOWNSIDE_TERMS):
+        return True
+
+    finance_downside = [
+        "less than", "under", "below", "down round", "not ipo", "delay ipo",
+    ]
+    leadership_downside = ["resign", "fired", "step down", "replace"]
+    competition_downside = ["lose to", "surpass", "beat", "before"]
+
+    if topic_detail in {"Stocks and Bonds", "Venture Capital", "Private Equity", "Mergers and Acquisitions"} and any(has_term(text, term) for term in finance_downside):
+        return True
+    if topic_detail == "Executive Leadership & Management" and any(has_term(text, term) for term in leadership_downside):
+        return True
+    if topic_detail in {"Political Issues & Policy", "Elections"} and any(has_term(text, term) for term in competition_downside):
+        return True
+
+    return False
 
 
 def is_relevant_market(market: dict, brand: str) -> bool:
@@ -417,8 +580,10 @@ def parse_yes_prob(m):
 def build_df(markets: list) -> pd.DataFrame:
     rows = []
     for m in markets:
+        question = m.get("question", "")
+        topic_group, topic_detail = classify_market_taxonomy(market_search_text(m))
         rows.append({
-            "question":    m.get("question", ""),
+            "question":    question,
             "status":      "Closed" if m.get("closed") else "Open",
             "yes_prob":    parse_yes_prob(m),
             "volume":      float(m.get("volume") or m.get("volumeNum") or 0),
@@ -427,6 +592,8 @@ def build_df(markets: list) -> pd.DataFrame:
             "end_date":    (m.get("endDate") or "")[:10],
             "tags":        ", ".join(t.get("label","") for t in (m.get("tags") or [])),
             "token_id":    (m.get("clobTokenIds") or "[]"),
+            "topic":       topic_group,
+            "topic_detail": topic_detail,
             "_raw":        m,
         })
     df = pd.DataFrame(rows)
@@ -436,17 +603,18 @@ def build_df(markets: list) -> pd.DataFrame:
     return df
 
 def risk_score(df: pd.DataFrame) -> float:
-    RISK_TERMS = ["regulat","law","legal","sue","antitrust","fine","ban",
-                  "compet","rival","surpass","market share","leadership",
-                  "ceo","resign","fired"]
-    if df.empty: return 0.0
+    if df.empty:
+        return 0.0
     open_df = df[df["status"] == "Open"].copy()
-    open_df["is_risk"] = open_df["question"].str.lower().apply(
-        lambda q: any(t in q for t in RISK_TERMS))
+    open_df["is_risk"] = open_df.apply(
+        lambda row: is_downside_market(row["question"], row["topic_detail"]), axis=1
+    )
     risk_df = open_df[open_df["is_risk"] & open_df["yes_prob"].notna()]
-    if risk_df.empty: return 0.0
+    if risk_df.empty:
+        return 0.0
     tvol = risk_df["volume"].sum()
-    if tvol == 0: return risk_df["yes_prob"].mean()
+    if tvol == 0:
+        return risk_df["yes_prob"].mean()
     return (risk_df["yes_prob"] * risk_df["volume"]).sum() / tvol
 
 # ── Plotting helpers ──────────────────────────────────────────────
@@ -460,24 +628,18 @@ PLOT_LAYOUT = dict(
 )
 
 def plot_volume_by_type(df: pd.DataFrame):
-    RISK_TERMS = ["regulat","law","legal","sue","antitrust","fine","ban",
-                  "compet","rival","surpass","leadership","ceo","resign"]
-    PRODUCT_TERMS = ["launch","release","gpt","model","feature","users","version","product"]
-
-    def classify(q):
-        ql = q.lower()
-        if any(t in ql for t in RISK_TERMS): return "Risk"
-        if any(t in ql for t in PRODUCT_TERMS): return "Product"
-        if any(t in ql for t in ["fund","invest","valuat","raise","billion"]): return "Funding"
-        if any(t in ql for t in ["partner","deal","microsoft","contract"]): return "Partnership"
-        if any(t in ql for t in ["ceo","founder","board","altman"]): return "Leadership"
-        return "Other"
-
     df = df.copy()
-    df["type"] = df["question"].apply(classify)
-    vol = df.groupby("type")["volume"].sum().sort_values() / 1e6
-    colors = {"Risk":"#ef4444","Product":"#06b6d4","Funding":"#22c55e",
-              "Partnership":"#ec4899","Leadership":"#7c3aed","Other":"#4b5563"}
+    vol = df.groupby("topic")["volume"].sum().sort_values() / 1e6
+    colors = {
+        "Product": "#06b6d4",
+        "Finance": "#22c55e",
+        "Leadership": "#7c3aed",
+        "Policy/Legal": "#ef4444",
+        "Competition": "#f59e0b",
+        "Partnerships": "#ec4899",
+        "Adoption": "#14b8a6",
+        "Other": "#4b5563",
+    }
     fig = go.Figure(go.Bar(
         x=vol.values, y=vol.index, orientation="h",
         marker_color=[colors.get(t,"#4b5563") for t in vol.index],
@@ -531,12 +693,23 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ── Search bar ────────────────────────────────────────────────────
-col_input, col_btn = st.columns([5, 1])
-with col_input:
-    brand = st.text_input("", placeholder="Enter a brand, product, or person — e.g. Nike, Tesla, Sam Altman",
-                          label_visibility="collapsed")
-with col_btn:
-    search = st.button("Search")
+if "active_brand" not in st.session_state:
+    st.session_state.active_brand = ""
+if "active_results" not in st.session_state:
+    st.session_state.active_results = []
+
+with st.form("brand_search_form"):
+    col_input, col_btn = st.columns([5, 1])
+    with col_input:
+        brand = st.text_input(
+            "",
+            value=st.session_state.active_brand,
+            placeholder="Enter a brand, product, or person — e.g. Nike, Tesla, Sam Altman",
+            label_visibility="collapsed",
+            key="brand_input",
+        )
+    with col_btn:
+        search = st.form_submit_button("Search", use_container_width=True)
 
 st.markdown("---")
 
@@ -544,17 +717,18 @@ st.markdown("---")
 if search and brand:
     with st.spinner(f"Fetching Polymarket data for **{brand}**…"):
         raw = search_brand(brand)
+    st.session_state.active_brand = brand
+    st.session_state.active_results = raw
 
-    if not raw:
-        st.warning(f"No markets found for **{brand}**. Try a different search term.")
-        st.stop()
+brand = st.session_state.active_brand
+raw = st.session_state.active_results
 
+if brand and raw:
     df = build_df(raw)
     open_df   = df[df["status"] == "Open"]
     closed_df = df[df["status"] == "Closed"]
     score     = risk_score(df)
 
-    # ── Summary metrics ───────────────────────────────────────────
     st.markdown(f'<div class="section-header">Overview — {brand}</div>', unsafe_allow_html=True)
 
     m1, m2, m3, m4, m5 = st.columns(5)
@@ -615,10 +789,10 @@ if search and brand:
     fc1, fc2, fc3 = st.columns([2, 2, 4])
     with fc1:
         status_filter = st.selectbox("Status", ["All", "Open", "Closed"],
-                                     label_visibility="collapsed")
+                                     label_visibility="collapsed", key="status_filter")
     with fc2:
         sort_by = st.selectbox("Sort by", ["Volume", "YES Probability", "24hr Volume"],
-                               label_visibility="collapsed")
+                               label_visibility="collapsed", key="sort_by")
 
     filtered = df.copy()
     if status_filter != "All":
@@ -664,11 +838,11 @@ if search and brand:
     if not open_markets.empty:
         market_options = {row["question"][:80]: row for _, row in open_markets.iterrows()}
         selected_q = st.selectbox("Pick a market", list(market_options.keys()),
-                                  label_visibility="collapsed")
+                                  label_visibility="collapsed", key="selected_market")
         selected = market_options[selected_q]
 
         interval = st.radio("Interval", ["1d", "1w", "1m", "3m", "all"],
-                            horizontal=True, label_visibility="collapsed")
+                            horizontal=True, label_visibility="collapsed", key="history_interval")
 
         try:
             token_ids = json.loads(selected["token_id"])
@@ -689,9 +863,9 @@ if search and brand:
     st.markdown('<div class="section-header">Export</div>', unsafe_allow_html=True)
 
     export_df = df[["question","status","yes_prob","volume","volume_24hr",
-                    "liquidity","end_date","tags"]].copy()
+                    "liquidity","end_date","topic","topic_detail","tags"]].copy()
     export_df.columns = ["Question","Status","YES%","Volume","24hr Vol",
-                          "Liquidity","End Date","Tags"]
+                          "Liquidity","End Date","Topic","Topic Detail","Tags"]
 
     csv = export_df.to_csv(index=False)
     filename = brand.lower().replace(" ", "_") + "_polymarket.csv"
@@ -699,6 +873,9 @@ if search and brand:
         label=f"⬇ Download CSV ({len(df)} markets)",
         data=csv, file_name=filename, mime="text/csv",
     )
+
+elif brand:
+    st.warning(f"No markets found for **{brand}**. Try a different search term.")
 
 elif not brand:
     st.markdown("""
